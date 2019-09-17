@@ -121,6 +121,129 @@ def gpnet(args, dataloader, test_x, prior_gp):
     return test_stats
 
 
+def gpnet_nonconj(args, dataloader, test_x, prior_gp):
+    N = len(dataloader.dataset)
+    x_dim = 1
+    prior_gp.train()
+
+    if args.net == 'tangent':
+        kernel = prior_gp.covar_module
+        bnn_prev = FirstOrder([x_dim] + [args.n_hidden] * args.n_layer, mvn=False)
+        bnn = FirstOrder([x_dim] + [args.n_hidden] * args.n_layer, mvn=True)
+    elif args.net == 'deep':
+        kernel = prior_gp.covar_module
+        bnn_prev = DeepKernel([x_dim] + [args.n_hidden] * args.n_layer, mvn=False)
+        bnn = DeepKernel([x_dim] + [args.n_hidden] * args.n_layer, mvn=True)
+    elif args.net == 'rf':
+        kernel = ScaleKernel(RBFKernel())
+        kernel_prev = ScaleKernel(RBFKernel())
+        bnn_prev = RFExpansion(x_dim, args.n_hidden, kernel_prev, mvn=False, fix_ls=args.fix_rf_ls, residual=args.residual)
+        bnn = RFExpansion(x_dim, args.n_hidden, kernel, fix_ls=args.fix_rf_ls, residual=args.residual)
+        bnn_prev.load_state_dict(bnn.state_dict())
+    else:
+        raise NotImplementedError('Unknown inference net')
+
+    infer_gpnet_optimizer = optim.Adam(bnn.parameters(), lr=args.learning_rate)
+    hyper_opt_optimizer = optim.Adam(prior_gp.parameters(), lr=args.hyper_rate)
+
+    x_min, x_max = dataloader.dataset.range
+    n = dataloader.batch_size
+
+    bnn.train()
+    bnn_prev.train()
+    prior_gp.train()
+
+    mb = master_bar(range(1, args.n_iters + 1))
+
+    for t in mb:
+        beta = args.beta0 * 1. / (1. + args.gamma * math.sqrt(t - 1))
+        dl_bar = progress_bar(dataloader, parent=mb)
+        for x, y in dl_bar:
+            n = x.size(0)
+            x_star = torch.Tensor(args.measurement_size, x_dim).uniform_(x_min, x_max)
+            xx = torch.cat([x, x_star], 0)
+
+            # inference net
+            infer_gpnet_optimizer.zero_grad()
+            hyper_opt_optimizer.zero_grad()
+
+            qff = bnn(xx)
+            qff_mean_prev, K_prox = bnn_prev(xx)
+            qf_mean, qf_var = bnn(x, full_cov=False)
+
+            # Eq.(8)
+            K_prior = kernel(xx, xx).add_jitter(1e-6)
+            pff = MultivariateNormal(torch.zeros(xx.size(0)), K_prior)
+
+            f_term = expected_log_prob(prior_gp.likelihood, qf_mean, qf_var, y.squeeze(-1))
+            f_term = torch.sum(expected_log_prob(prior_gp.likelihood, qf_mean, qf_var, y.squeeze(-1)))
+            f_term *= N / x.size(0) * beta
+
+            prior_term = -beta * cross_entropy(qff, pff)
+
+            qff_prev = MultivariateNormal(qff_mean_prev, K_prox)
+            prox_term = - (1 - beta) * cross_entropy(qff, qff_prev)
+
+            entropy_term = entropy(qff)
+
+            lower_bound = f_term + prior_term + prox_term + entropy_term
+            loss = - lower_bound / n
+
+            loss.backward(retain_graph=True)
+
+            infer_gpnet_optimizer.step()
+
+            # Hyper-parameter update
+            Kn_prior = K_prior[:n, :n]
+            pf = MultivariateNormal(torch.zeros(n), Kn_prior)
+            Kn_prox = K_prox[:n, :n]
+            qf_prev_mean = qff_mean_prev[:n]
+            qf_prev_var = torch.diagonal(Kn_prox)
+            qf_prev = MultivariateNormal(qf_prev_mean, Kn_prior)
+            hyper_obj = expected_log_prob(prior_gp.likelihood, qf_prev_mean, qf_prev_var, y.squeeze(-1)).sum() - kl_div(qf_prev, pf)
+            hyper_obj = -hyper_obj
+            hyper_obj.backward()
+            hyper_opt_optimizer.step()
+
+        bnn_prev.load_state_dict(bnn.state_dict())
+        if args.net == 'rf':
+            kernel_prev.load_state_dict(kernel.state_dict())
+        if t % 50 == 0:
+            mb.write(
+                "Iter {}/{}, kl_obj = {:.4f}, noise = {:.4f}".format(
+                    t, args.n_iters, lower_bound.item(), prior_gp.likelihood.noise.item()))
+    test_stats = evaluate(bnn, prior_gp.likelihood, test_x, args.net == 'tangent')
+
+    return test_stats
+
+
+def expected_log_prob(likelihood, mean, variance, target):
+    noise = likelihood.noise
+    res = ((target - mean) ** 2 + variance) / noise + noise.log() + math.log(2 * math.pi)
+    return res.mul(-0.5).sum(-1)
+
+
+def cross_entropy(p, q):
+    d = p.mean.size(-1)
+    ret = 0.5 * d * math.log(2 * math.pi)
+    ret += q.variance.log().sum(-1)
+    q_cov_tril = torch.cholesky(q.covariance_matrix)
+    p_cov_tril = torch.cholesky(p.covariance_matrix)
+    q_inv_p = torch.triangular_solve(p_cov_tril, q_cov_tril)[0]
+    ret += 0.5 * q_inv_p.pow(2).sum(-1).sum(-1)
+    Kinv_m = cholesky_solve((p.mean - q.mean).unsqueeze(-1), q_cov_tril)
+    ret += 0.5 * torch.sum((p.mean - q.mean) * Kinv_m.squeeze(-1), -1)
+    return ret
+
+
+def entropy(p):
+    d = p.mean.size(-1)
+    ret = 0.5 * d * math.log(2 * math.pi)
+    ret += p.variance.log().sum(-1)
+    ret += 0.5 * d
+    return ret
+
+
 def evaluate(bnn, likelihood, x, requires_grad=False):
     bnn.eval()
 
@@ -134,3 +257,4 @@ def evaluate(bnn, likelihood, x, requires_grad=False):
         test_y_vars += likelihood.noise
 
     return TestStats(test_y_means.unsqueeze(-1), test_y_vars.unsqueeze(-1))
+

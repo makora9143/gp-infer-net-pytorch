@@ -1,3 +1,3 @@
 from .gp import exact_gp
 from .svgp import svgp
-from .gpnet import gpnet
+from .gpnet import gpnet, gpnet_nonconj
