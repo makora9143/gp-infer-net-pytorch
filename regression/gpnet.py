@@ -37,6 +37,9 @@ def gpnet(args, dataloader, test_x, prior_gp):
         bnn_prev.load_state_dict(bnn.state_dict())
     else:
         raise NotImplementedError('Unknown inference net')
+    bnn = bnn.to(args.device)
+    bnn_prev = bnn_prev.to(args.device)
+    prior_gp = prior_gp.to(args.device)
 
     infer_gpnet_optimizer = optim.Adam(bnn.parameters(), lr=args.learning_rate)
     hyper_opt_optimizer = optim.Adam(prior_gp.parameters(), lr=args.hyper_rate)
@@ -55,7 +58,8 @@ def gpnet(args, dataloader, test_x, prior_gp):
         dl_bar = progress_bar(dataloader, parent=mb)
         for x, y in dl_bar:
             n = x.size(0)
-            x_star = torch.Tensor(args.measurement_size, x_dim).uniform_(x_min, x_max)
+            x, y = x.to(args.device), y.to(args.device)
+            x_star = torch.Tensor(args.measurement_size, x_dim).uniform_(x_min, x_max).to(args.device)
             xx = torch.cat([x, x_star], 0)
 
             # inference net
@@ -79,7 +83,7 @@ def gpnet(args, dataloader, test_x, prior_gp):
             mean_n, mean_m = mean_adapt[:n, :], mean_adapt[n:, :]
 
             # Eq.(10) and Eq.(2)
-            Ky = Kn + torch.eye(n) * prior_gp.likelihood.noise / (N / n * beta)
+            Ky = Kn + torch.eye(n).to(args.device) * prior_gp.likelihood.noise / (N / n * beta)
             Ky_tril = torch.cholesky(Ky)
 
             mean_target = Knm.t().mm(cholesky_solve(y - mean_n, Ky_tril)) + mean_m
@@ -95,7 +99,7 @@ def gpnet(args, dataloader, test_x, prior_gp):
 
             # Hyper paramter update
             Kn_prior = K_prior[:n, :n]
-            pf = MultivariateNormal(torch.zeros(n), Kn_prior)
+            pf = MultivariateNormal(torch.zeros(n).to(args.device), Kn_prior)
             Kn_prox = K_prox[:n, :n]
             qf_prev_mean = qff_mean_prev[:n]
             qf_prev = MultivariateNormal(qf_prev_mean, Kn_prox)
@@ -117,6 +121,7 @@ def gpnet(args, dataloader, test_x, prior_gp):
                 "Iter {}/{}, kl_obj = {:.4f}, noise = {:.4f}".format(
                     t, args.n_iters, kl_obj.item(), prior_gp.likelihood.noise.item()))
 
+    test_x = test_x.to(args.device)
     test_stats = evaluate(bnn, prior_gp.likelihood, test_x, args.net == 'tangent')
     return test_stats
 
@@ -212,6 +217,7 @@ def gpnet_nonconj(args, dataloader, test_x, prior_gp):
             mb.write(
                 "Iter {}/{}, kl_obj = {:.4f}, noise = {:.4f}".format(
                     t, args.n_iters, lower_bound.item(), prior_gp.likelihood.noise.item()))
+    test_x = test_x.to(args.device)
     test_stats = evaluate(bnn, prior_gp.likelihood, test_x, args.net == 'tangent')
 
     return test_stats
@@ -256,5 +262,5 @@ def evaluate(bnn, likelihood, x, requires_grad=False):
         test_y_means, test_y_vars = bnn(x, full_cov=False)
         test_y_vars += likelihood.noise
 
-    return TestStats(test_y_means.unsqueeze(-1), test_y_vars.unsqueeze(-1))
+    return TestStats(test_y_means.cpu().unsqueeze(-1), test_y_vars.cpu().unsqueeze(-1))
 

@@ -6,12 +6,27 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 
-from regression import exact_gp, svgp, gpnet
+from trains import Task
+
+from regression import exact_gp, svgp, gpnet, gpnet_nonconj
 from dataset import Snelson
 
-torch.manual_seed(1234)
-np.random.seed(1234)
+torch.manual_seed(1)
+np.random.seed(13)
 
+
+def parse_argparse(args):
+    dict_args = vars(args)
+    text = ''
+    for k, v in dict_args.items():
+        if k == 'no_log':
+            continue
+        kv_string = '{}_{}'.format(k, v)
+        if text == '':
+            text = kv_string
+        else:
+            text = text + "-" + kv_string
+    return text
 
 def set_up_figure(data, test_stats):
     train_x, train_y, test_x = data
@@ -65,12 +80,18 @@ def main():
         test_stats = gpnet(args, dataloader, dataset.test_x, prior_gp=gp)
         plot_method(data, test_stats, 'g')
 
+    if args.method == 'gpnet_nonconj':
+        test_stats = gpnet_nonconj(args, dataloader, dataset.test_x, prior_gp=gp)
+        plot_method(data, test_stats, 'g')
+
+
+    plt.savefig('hoge.png')
     plt.show()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--method', default='gpnet', choices=['svgp', 'gpnet'],
+    parser.add_argument('--method', default='gpnet', choices=['svgp', 'gpnet', 'gpnet_nonconj'],
                         help='Inference algorithm')
     parser.add_argument('--batch-size', '-B', type=int, default=20,
                         help='Total batch size')
@@ -102,5 +123,20 @@ if __name__ == '__main__':
     parser.add_argument('--lr-anneal', default=False, action='store_true', help='learning rate annealed by beta')
     parser.add_argument('--fix-rf-ls', default=False, action='store_true', help='fix the lengthscales of rf as prior')
 
+    parser.add_argument('--no-log', default=False, action='store_true')
+    parser.add_argument('--no-cuda', default=False, action='store_true')
+
     args = parser.parse_args()
+
+    args.device = torch.device('cuda') if torch.cuda.is_available() and not args.no_cuda else torch.device('cpu')
+
+    # filename = '{}'.format(
+    #     parse_argparse(args))
+    filename = 'gpnet-rf'
+    print(filename)
+    if not args.no_log:
+        task = Task.init(
+            project_name='GPNet',
+            task_name=filename)
+
     main()
