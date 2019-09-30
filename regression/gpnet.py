@@ -45,7 +45,6 @@ def gpnet(args, dataloader, test_x, prior_gp):
     hyper_opt_optimizer = optim.Adam(prior_gp.parameters(), lr=args.hyper_rate)
 
     x_min, x_max = dataloader.dataset.range
-    n = dataloader.batch_size
 
     bnn.train()
     bnn_prev.train()
@@ -54,58 +53,65 @@ def gpnet(args, dataloader, test_x, prior_gp):
     mb = master_bar(range(1, args.n_iters + 1))
 
     for t in mb:
+        # Hyperparameter selection
         beta = args.beta0 * 1. / (1. + args.gamma * math.sqrt(t - 1))
         dl_bar = progress_bar(dataloader, parent=mb)
         for x, y in dl_bar:
-            n = x.size(0)
+            observed_size = x.size(0)
             x, y = x.to(args.device), y.to(args.device)
             x_star = torch.Tensor(args.measurement_size, x_dim).uniform_(x_min, x_max).to(args.device)
+            # [Batch + Measurement Points x x_dims]
             xx = torch.cat([x, x_star], 0)
 
-            # inference net
             infer_gpnet_optimizer.zero_grad()
             hyper_opt_optimizer.zero_grad()
 
-            qf_star = bnn(x_star)
-            qff_mean_prev, K_prox = bnn_prev(xx)
-
-            # Eq.(8)
+            # inference net
+            # Eq.(6) Prior p(f)
+            # \mu_1=0, \Sigma_1
+            mean_prior = torch.zeros(observed_size).to(args.device)
             K_prior = kernel(xx, xx).add_jitter(1e-6)
 
-            K_sum = K_prior * (1 - beta) + K_prox * beta
+            # q_{\gamma_t}(f_M, f_n) = Normal(mu_2, sigma_2|x_n, x_m)
+            # \mu_2, \Sigma_2
+            qff_mean_prev, K_prox = bnn_prev(xx)
 
-            # \Sigma_3 = \Sigma_1(\Sigma_1 + \Sigma_2)^{-1}\Sigma_2
-            K_adapt = K_prior.matmul(K_sum.inv_matmul(K_prox))
-            Kn, Knm, Km = K_adapt[:n, :n], K_adapt[:n, n:], K_adapt[n:, n:]
+            # Eq.(8) adapt prior; p(f)^\beta x q(f)^{1 - \beta}
+            mean_adapt, K_adapt = product_gaussians(mu1=mean_prior, sigma1=K_prior,
+                                                    mu2=qff_mean_prev, sigma2=K_prox,
+                                                    beta=beta)
 
-            # \mu_3 = \Sigma_3\Sigma_2^{-1}\mu_2
-            mean_adapt = K_adapt.mm(torch.solve(qff_mean_prev[..., None], K_prox)[0]) * (1 - beta)
-            mean_n, mean_m = mean_adapt[:n, :], mean_adapt[n:, :]
+            # Eq.(8)
+            (mean_n, mean_m), (Knn, Knm, Kmm) = split_gaussian(mean_adapt, K_adapt, observed_size)
 
-            # Eq.(10) and Eq.(2)
-            Ky = Kn + torch.eye(n).to(args.device) * prior_gp.likelihood.noise / (N / n * beta)
+            # Eq.(2) K_{D,D} + noise / (N\beta_t)
+            Ky = Knn + torch.eye(observed_size).to(args.device) * prior_gp.likelihood.noise / (N / observed_size * beta)
             Ky_tril = torch.cholesky(Ky)
 
+            # Eq.(2)
             mean_target = Knm.t().mm(cholesky_solve(y - mean_n, Ky_tril)) + mean_m
             mean_target = mean_target.squeeze(-1)
-            K_target = gpytorch.add_jitter(Km - Knm.t().mm(cholesky_solve(Knm, Ky_tril)))
-
+            K_target = gpytorch.add_jitter(Kmm - Knm.t().mm(cholesky_solve(Knm, Ky_tril)), 1e-6)
+            # \hat{q}_{t+1} (f_M)
             target_pf_star = MultivariateNormal(mean_target, K_target)
 
+            # q_\gamma (f_M)
+            qf_star = bnn(x_star)
+
+            # Eq. (11)
             kl_obj = kl_div(qf_star, target_pf_star).sum()
 
             kl_obj.backward(retain_graph=True)
             infer_gpnet_optimizer.step()
 
             # Hyper paramter update
-            Kn_prior = K_prior[:n, :n]
-            pf = MultivariateNormal(torch.zeros(n).to(args.device), Kn_prior)
-            Kn_prox = K_prox[:n, :n]
-            qf_prev_mean = qff_mean_prev[:n]
+            (mean_n_prior, _), (Kn_prior, _, _) = split_gaussian(mean_prior, K_prior, observed_size)
+            pf = MultivariateNormal(mean_n_prior, Kn_prior)
+
+            (qf_prev_mean, _), (Kn_prox, _, _) = split_gaussian(qff_mean_prev, K_prox, observed_size)
             qf_prev = MultivariateNormal(qf_prev_mean, Kn_prox)
 
-            hyper_obj = prior_gp.likelihood.expected_log_prob(y.squeeze(-1), qf_prev) - kl_div(qf_prev, pf)
-            hyper_obj = - hyper_obj
+            hyper_obj = - (prior_gp.likelihood.expected_log_prob(y.squeeze(-1), qf_prev) - kl_div(qf_prev, pf))
             hyper_obj.backward(retain_graph=True)
             hyper_opt_optimizer.step()
 
@@ -124,6 +130,36 @@ def gpnet(args, dataloader, test_x, prior_gp):
     test_x = test_x.to(args.device)
     test_stats = evaluate(bnn, prior_gp.likelihood, test_x, args.net == 'tangent')
     return test_stats
+
+
+def split_gaussian(mean, variance, n):
+    """Separate gaussian by n
+     -----      ---------   -----
+    | m_n |    |  Knn    | | Knm |
+    |     |    |         | |     |
+     -----      ---------   -----
+     -----  ,   ---------   -----
+    | m_m |    |  Kmn    | | Kmm |
+     -----      ---------   -----
+    """
+    mean_n, mean_m = mean[:n], mean[n:]
+    variance_nn, variance_nm, variance_mm = variance[:n, :n], variance[:n, n:], variance[n:, n:]
+    return (mean_n, mean_m), (variance_nn, variance_nm, variance_mm)
+
+
+def product_gaussians(mu1, sigma1, mu2, sigma2, beta=0.0):
+    # https://math.stackexchange.com/questions/157172/product-of-two-multivariate-gaussians-distributions
+    # sigma1 = prior, sigma2 = neural networks
+    # \Sigma_1 + \Sigma_2
+    K_sum = sigma1 * (1 - beta) + sigma2 * beta
+
+    # \Sigma_3 = \Sigma_1(\Sigma_1 + \Sigma_2)^{-1}\Sigma_2
+    K_adapt = sigma1.matmul(K_sum.inv_matmul(sigma2))
+
+    # \mu_3 = \Sigma_3\Sigma_2^{-1}\mu_2
+    # \mu_3 = \Sigma_3\Sigma_1^{-1}\mu_1 + \Sigma_3\Sigma_2^{-1}\mu_2
+    mean_adapt = K_adapt.mm(torch.solve(mu2.unsqueeze(-1), sigma2)[0]) * (1 - beta)
+    return mean_adapt, K_adapt
 
 
 def gpnet_nonconj(args, dataloader, test_x, prior_gp):
@@ -263,4 +299,3 @@ def evaluate(bnn, likelihood, x, requires_grad=False):
         test_y_vars += likelihood.noise
 
     return TestStats(test_y_means.cpu().unsqueeze(-1), test_y_vars.cpu().unsqueeze(-1))
-
